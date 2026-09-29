@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apple Drop</title>
+<meta name="description" content="Drop apples past the ghosts and into the gap. A hard, old-fashioned arcade game.">
+<style>
+  /* base rules the Claude artifact viewer normally supplies */
+  :root{color-scheme:light}
+  img{max-width:100%}
+
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: monospace;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  #screen {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    display: block;
+  }
+  #hint {
+    position: fixed; bottom: 6px; left: 0; right: 0;
+    text-align: center; color: #444; font-size: 11px;
+    pointer-events: none; letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="hint">&larr; &rarr; / A D&nbsp;&nbsp;MOVE&nbsp;&nbsp;&bull;&nbsp;&nbsp;SPACE&nbsp;DROP&nbsp;&nbsp;&bull;&nbsp;&nbsp;ENTER&nbsp;INSERT&nbsp;10p&nbsp;&nbsp;&bull;&nbsp;&nbsp;Q&nbsp;QUIT</div>
+<script>
+"use strict";
+//============================================================================
+// APPLE DROP  -  a hard old-fashioned arcade game.
+// Drop apples through the level, dodge ghosts, bounce off green trampolines,
+// land one apple in the exit gap to clear. 3 apples = 3 lives, for the
+// whole run. Any apple that ends without clearing the level is consumed.
+// 10 levels. Single file, vanilla canvas, chunky pixels.
+//============================================================================
+
+//--------------------------------------------------------------- config
+var VW = 200, VH = 300;          // virtual (low-res) resolution
+var HUD_H = 30;                  // top HUD bar height
+var PLAY_L = 6, PLAY_R = VW - 6; // side walls of the play field
+var FLOOR_Y = VH - 16;           // top of the floor
+var START_APPLES = 3;
+
+var GRAVITY = 430;               // px/s^2
+var MAX_FALL = 260;              // terminal velocity
+var WALL_REST = 0.28;            // wall bounciness
+var BOUNCE_REST = 1.55;          // bouncy-block bounciness
+var BOUNCE_MIN = 190;            // min speed a bouncy block imparts
+var SETTLE_SPEED = 16;           // below this speed apple is "resting"
+var SETTLE_TICKS = 40;           // ticks resting before it's declared spent
+var APPLE_R = 5;
+var COIN_COST = 10;              // pence per credit (insert-coin arcade economy)
+
+//--------------------------------------------------------------- palette (16-ish)
+var C = {
+  bg0:   "#0d0b1a", bg1: "#161228",
+  hud:   "#08060f",
+  wall:  "#3b4a6b", wallHi: "#5a6f9c",
+  bounce:"#f2a03d", bounceHi: "#ffd27f",
+  ghost: "#c94fd6", ghostHi: "#f2a8fb", ghostEye: "#ffffff", ghostPup: "#20122a",
+  apple: "#e23c3c", appleHi: "#ff7a6b", stem: "#6b3a1e", leaf: "#4fbf5a",
+  exit:  "#38e08a", exitDk: "#177a4a",
+  tramp: "#2fd46e", trampHi: "#b6ffd0", trampDk: "#12813f",
+  launch:"#8fd0ff", launchHi: "#ffffff",
+  text:  "#f5f0d8", textDim: "#7c7896", accent: "#ffd27f",
+  danger:"#ff5566"
+};
+
+//--------------------------------------------------------------- canvas setup
+var screen = document.getElementById("screen");
+var sctx = screen.getContext("2d");
+
+// offscreen virtual buffer
+var buf = document.createElement("canvas");
+buf.width = VW; buf.height = VH;
+var ctx = buf.getContext("2d");
+
+var scale = 1, offX = 0, offY = 0;
+function resize() {
+  var w = window.innerWidth, h = window.innerHeight;
+  scale = Math.max(1, Math.floor(Math.min(w / VW, h / VH)));
+  var dw = VW * scale, dh = VH * scale;
+  screen.width = dw; screen.height = dh;
+  screen.style.width = dw + "px";
+  screen.style.height = dh + "px";
+  sctx.imageSmoothingEnabled = false;
+  offX = 0; offY = 0;
+}
+window.addEventListener("resize", resize);
+resize();
+
+//--------------------------------------------------------------- audio (tiny beeps)
+var AC = null;
+function actx() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  return AC;
+}
+function beep(freq, dur, type, vol) {
+  var a = actx(); if (!a) return;
+  var o = a.createOscillator(), g = a.createGain();
+  o.type = type || "square";
+  o.frequency.value = freq;
+  g.gain.value = vol == null ? 0.06 : vol;
+  o.connect(g); g.connect(a.destination);
+  var t = a.currentTime;
+  o.start(t);
+  g.gain.setValueAtTime(g.gain.value, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.stop(t + dur);
+}
+var sfx = {
+  drop:   function () { beep(520, 0.08, "square", 0.05); },
+  bounce: function () { beep(760, 0.07, "square", 0.06); },
+  wall:   function () { beep(180, 0.04, "triangle", 0.04); },
+  eaten:  function () { beep(150, 0.25, "sawtooth", 0.08); setTimeout(function(){beep(90,0.3,"sawtooth",0.07);},60); },
+  clear:  function () { beep(660, 0.1, "square", 0.07); setTimeout(function(){beep(990,0.16,"square",0.07);},110); },
+  spent:  function () { beep(220, 0.12, "triangle", 0.05); },
+  over:   function () { beep(300,0.2,"sawtooth",0.08); setTimeout(function(){beep(200,0.25,"sawtooth",0.08);},180); setTimeout(function(){beep(120,0.4,"sawtooth",0.08);},380); },
+  win:    function () { [523,659,784,1047].forEach(function(f,i){ setTimeout(function(){beep(f,0.18,"square",0.07);}, i*140); }); }
+};
+
+//--------------------------------------------------------------- input
+var keys = {};
+var pressed = {};
+window.addEventListener("keydown", function (e) {
+  var k = e.key.toLowerCase();
+  if ([" ", "arrowleft", "arrowright", "arrowup", "arrowdown"].indexOf(k) >= 0) e.preventDefault();
+  if (!keys[k]) pressed[k] = true;
+  keys[k] = true;
+  if (AC && AC.state === "suspended") AC.resume();
+});
+window.addEventListener("keyup", function (e) { keys[e.key.toLowerCase()] = false; });
+function keyDown(k) { return !!keys[k]; }
+function justPressed(k) { if (pressed[k]) { pressed[k] = false; return true; } return false; }
+// touch: tap left/right half to move, tap top-center-ish to drop
+screen.addEventListener("pointerdown", function (e) {
+  if (AC && AC.state === "suspended") AC.resume();
+  pressed[" "] = true; keys[" "] = true;
+  setTimeout(function(){ keys[" "] = false; }, 30);
+});
+
+//--------------------------------------------------------------- helpers
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function box(x, y, w, h, extra) {
+  var b = { x: x, y: y, w: w, h: h, bouncy: false, sq: 0 };
+  if (extra) for (var k in extra) b[k] = extra[k];
+  return b;
+}
+
+//--------------------------------------------------------------- levels
+// Each level: launcherX, exit {x,w}, walls[], bouncers[], tramps[], ghosts[]
+// Ghost: {w,h, ax,ay, bx,by, speed, phase} patrols a->b and back.
+function ghost(ax, ay, bx, by, speed, phase) {
+  return { w: 15, h: 15, ax: ax, ay: ay, bx: bx, by: by,
+           speed: speed, t: phase || 0, x: ax, y: ay };
+}
+function wall(x, y, w, h) { return box(x, y, w, h, { bouncy: false }); }
+function bumper(x, y, w, h) { return box(x, y, w, h, { bouncy: true }); }
+function tramp(x, y, r) { return { x: x, y: y, r: r == null ? 8 : r }; }
+
+var FY = FLOOR_Y;
+var LEVELS = [
+  // 1 — warm-up: wide-lap hugger + crossers, side trampolines
+  { launcherX: 100, exit: { x: 85, w: 30 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9) ],
+    ghosts: [ ghost(74, 80, 126, 80, 30, 0.0), ghost(20, 168, 180, 168, 58, 0.5), ghost(180, 256, 20, 256, 58, 1.0) ] },
+  // 2 — hugger over a 27px gap
+  { launcherX: 100, exit: { x: 87, w: 27 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9) ],
+    ghosts: [ ghost(74, 80, 126, 80, 33, 0.31), ghost(20, 168, 180, 168, 66, 0.81), ghost(180, 256, 20, 256, 66, 1.31) ] },
+  // 3 — two wide-lap huggers, quick crossers
+  { launcherX: 100, exit: { x: 88, w: 24 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9) ],
+    ghosts: [ ghost(62, 80, 138, 80, 36, 0.62), ghost(20, 138, 180, 138, 74, 1.12), ghost(62, 197, 138, 197, 36, 1.62), ghost(180, 256, 20, 256, 74, 0.12) ] },
+  // 4 — two huggers + fast crossers
+  { launcherX: 100, exit: { x: 89, w: 22 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9) ],
+    ghosts: [ ghost(64, 80, 136, 80, 39, 0.93), ghost(20, 138, 180, 138, 82, 1.43), ghost(64, 197, 136, 197, 39, 1.93), ghost(180, 256, 20, 256, 82, 0.43) ] },
+  // 5 — five ghosts, 20px gap
+  { launcherX: 100, exit: { x: 90, w: 20 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9), tramp(52, 234, 8) ],
+    ghosts: [ ghost(64, 80, 136, 80, 42, 1.24), ghost(20, 124, 180, 124, 90, 1.74), ghost(64, 168, 136, 168, 42, 0.24), ghost(180, 212, 20, 212, 90, 0.74), ghost(20, 256, 180, 256, 90, 1.24) ] },
+  // 6 — denser weave, 18px gap
+  { launcherX: 100, exit: { x: 91, w: 18 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9), tramp(52, 234, 8) ],
+    ghosts: [ ghost(64, 80, 136, 80, 45, 1.55), ghost(20, 124, 180, 124, 98, 0.05), ghost(64, 168, 136, 168, 45, 0.55), ghost(180, 212, 20, 212, 98, 1.05), ghost(20, 256, 180, 256, 98, 1.55) ] },
+  // 7 — three huggers, 17px gap
+  { launcherX: 100, exit: { x: 92, w: 17 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9), tramp(52, 234, 8), tramp(148, 234, 8) ],
+    ghosts: [ ghost(64, 80, 136, 80, 48, 0.7), ghost(64, 124, 136, 124, 48, 1.2), ghost(64, 168, 136, 168, 48, 1.7), ghost(180, 212, 20, 212, 106, 0.2), ghost(20, 256, 180, 256, 106, 0.7) ] },
+  // 8 — six ghosts, 16px gap
+  { launcherX: 100, exit: { x: 92, w: 16 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9), tramp(52, 234, 8), tramp(148, 234, 8) ],
+    ghosts: [ ghost(62, 80, 138, 80, 51, 0.17), ghost(20, 115, 180, 115, 114, 0.67), ghost(62, 150, 138, 150, 51, 1.17), ghost(180, 185, 20, 185, 114, 1.67), ghost(62, 220, 138, 220, 51, 0.17), ghost(20, 256, 180, 256, 114, 0.67) ] },
+  // 9 — six fast ghosts, 15px slot
+  { launcherX: 100, exit: { x: 93, w: 15 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9), tramp(52, 234, 8), tramp(148, 234, 8) ],
+    ghosts: [ ghost(59, 80, 141, 80, 54, 0.48), ghost(20, 115, 180, 115, 122, 0.98), ghost(59, 150, 141, 150, 54, 1.48), ghost(180, 185, 20, 185, 122, 1.98), ghost(59, 220, 141, 220, 54, 0.48), ghost(20, 256, 180, 256, 122, 0.98) ] },
+  // 10 — nightmare: six ghosts, 14px slot
+  { launcherX: 100, exit: { x: 93, w: 14 },
+    walls: [ ], bouncers: [ ],
+    tramps: [ tramp(45, 110, 8), tramp(155, 110, 8), tramp(30, 172, 9), tramp(170, 172, 9), tramp(52, 234, 8), tramp(148, 234, 8) ],
+    ghosts: [ ghost(60, 80, 140, 80, 57, 0.79), ghost(20, 115, 180, 115, 130, 1.29), ghost(60, 150, 140, 150, 57, 1.79), ghost(180, 185, 20, 185, 130, 0.29), ghost(60, 220, 140, 220, 57, 0.79), ghost(20, 256, 180, 256, 130, 1.29) ] }
+];
+
+//--------------------------------------------------------------- game state
+var GS = { TITLE: 0, PLAY: 1, CLEAR: 2, OVER: 3, WIN: 4 };
+var game = {
+  state: GS.TITLE,
+  levelIndex: 0,
+  apples: START_APPLES,
+  score: 0,
+  launcherX: 100,
+  launcherDir: 1,
+  apple: null,        // active flying apple or null
+  settle: 0,
+  particles: [],
+  walls: [], bouncers: [], tramps: [], ghosts: [], exit: null,
+  flashTimer: 0,      // ms of level-clear/over screen before it accepts input
+  coins: 0,           // credits inserted this run (10p each)
+  moneySpent: 0,      // total pence fed into the machine this run
+  msg: "", msgSub: ""
+};
+
+// pence -> pretty string: "10p", "90p", "£1.20"
+function money(pence) {
+  if (pence < 100) return pence + "p";
+  var pounds = Math.floor(pence / 100), rem = pence % 100;
+  return "£" + pounds + "." + (rem < 10 ? "0" : "") + rem;
+}
+
+function loadLevel(i) {
+  var L = LEVELS[i];
+  game.launcherX = L.launcherX;
+  game.exit = L.exit;
+  // clone geometry so per-run mutation (squash) doesn't corrupt source data
+  game.walls = L.walls.map(function (w) { return box(w.x, w.y, w.w, w.h, { bouncy: false }); });
+  // auto floor with a gap at the exit
+  game.walls.push(wall(PLAY_L, FY, L.exit.x - PLAY_L, VH - FY));
+  game.walls.push(wall(L.exit.x + L.exit.w, FY, PLAY_R - (L.exit.x + L.exit.w), VH - FY));
+  game.bouncers = L.bouncers.map(function (b) { return box(b.x, b.y, b.w, b.h, { bouncy: true }); });
+  game.tramps = (L.tramps || []).map(function (t) { return { x: t.x, y: t.y, r: t.r, sq: 0 }; });
+  game.ghosts = L.ghosts.map(function (g) {
+    return ghost(g.ax, g.ay, g.bx, g.by, g.speed, g.t);
+  });
+  game.apple = null;
+  game.settle = 0;
+  game.particles = [];
+}
+
+// insert first coin, fresh run from level 1
+function startRun() {
+  game.levelIndex = 0;
+  game.apples = START_APPLES;
+  game.score = 0;
+  game.coins = 1;
+  game.moneySpent = COIN_COST;
+  loadLevel(0);
+  game.state = GS.PLAY;
+}
+
+// insert another coin to continue from the level you died on
+function continueRun() {
+  game.coins += 1;
+  game.moneySpent += COIN_COST;
+  game.apples = START_APPLES;
+  loadLevel(game.levelIndex);
+  game.state = GS.PLAY;
+}
+
+function dropApple() {
+  if (game.apple) return;
+  if (game.apples <= 0) return;
+  game.apple = { x: game.launcherX, y: HUD_H + 8, vx: 0, vy: 20, r: APPLE_R, alive: true };
+  game.settle = 0;
+  sfx.drop();
+}
+
+// apple resolved without clearing: consume one apple
+function spendApple(eaten) {
+  game.apple = null;
+  game.apples -= 1;
+  if (eaten) sfx.eaten(); else sfx.spent();
+  if (game.apples <= 0) {
+    game.state = GS.OVER;
+    game.flashTimer = 800;
+    sfx.over();
+  }
+}
+
+function clearLevel() {
+  game.apple = null;
+  game.score += 500 + game.apples * 100 + game.levelIndex * 50;
+  sfx.clear();
+  if (game.levelIndex >= LEVELS.length - 1) {
+    game.state = GS.WIN;
+    game.flashTimer = 1000;
+    sfx.win();
+  } else {
+    game.state = GS.CLEAR;
+    game.flashTimer = 700;
+  }
+}
+
+function nextLevel() {
+  game.levelIndex += 1;
+  loadLevel(game.levelIndex);
+  game.state = GS.PLAY;
+}
+
+//--------------------------------------------------------------- particles
+function burst(x, y, color, n) {
+  for (var i = 0; i < n; i++) {
+    var a = (Math.PI * 2 * i) / n + (i % 2 ? 0.4 : 0);
+    var s = 40 + (i % 3) * 30;
+    game.particles.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 20,
+      life: 0.5 + (i % 3) * 0.15, t: 0, color: color });
+  }
+}
+
+//--------------------------------------------------------------- physics
+function collide(apple, b) {
+  var cx = clamp(apple.x, b.x, b.x + b.w);
+  var cy = clamp(apple.y, b.y, b.y + b.h);
+  var dx = apple.x - cx, dy = apple.y - cy;
+  var d2 = dx * dx + dy * dy;
+  if (d2 > apple.r * apple.r) return false;
+
+  var nx, ny, d;
+  if (d2 > 0.0001) {
+    d = Math.sqrt(d2); nx = dx / d; ny = dy / d;
+  } else {
+    // center inside box: eject along least-penetration axis
+    var toL = apple.x - b.x, toR = b.x + b.w - apple.x;
+    var toT = apple.y - b.y, toB = b.y + b.h - apple.y;
+    var m = Math.min(toL, toR, toT, toB);
+    if (m === toL) { nx = -1; ny = 0; }
+    else if (m === toR) { nx = 1; ny = 0; }
+    else if (m === toT) { nx = 0; ny = -1; }
+    else { nx = 0; ny = 1; }
+    d = 0;
+  }
+  var pen = apple.r - d;
+  apple.x += nx * pen;
+  apple.y += ny * pen;
+
+  var vn = apple.vx * nx + apple.vy * ny;
+  if (vn < 0) {
+    if (b.bouncy) {
+      apple.vx -= (1 + BOUNCE_REST) * vn * nx;
+      apple.vy -= (1 + BOUNCE_REST) * vn * ny;
+      // ensure a strong minimum kick along the normal
+      var outN = apple.vx * nx + apple.vy * ny;
+      if (outN < BOUNCE_MIN) {
+        apple.vx += (BOUNCE_MIN - outN) * nx;
+        apple.vy += (BOUNCE_MIN - outN) * ny;
+      }
+      b.sq = 1; // squash animation
+      sfx.bounce();
+    } else {
+      apple.vx -= (1 + WALL_REST) * vn * nx;
+      apple.vy -= (1 + WALL_REST) * vn * ny;
+      // tangential friction
+      var tx = -ny, ty = nx;
+      var vt = apple.vx * tx + apple.vy * ty;
+      apple.vx -= vt * 0.18 * tx;
+      apple.vy -= vt * 0.18 * ty;
+      if (Math.abs(vn) > 60) sfx.wall();
+    }
+  }
+  return true;
+}
+
+// circle apple vs circle trampoline: springy bounce with a strong minimum kick
+function collideTramp(apple, t) {
+  var dx = apple.x - t.x, dy = apple.y - t.y;
+  var rr = apple.r + t.r;
+  var d2 = dx * dx + dy * dy;
+  if (d2 > rr * rr) return false;
+  var d = Math.sqrt(d2);
+  var nx, ny;
+  if (d > 0.0001) { nx = dx / d; ny = dy / d; }
+  else { nx = 0; ny = -1; }        // dead-centre hit: fling straight up
+  var pen = rr - d;
+  apple.x += nx * pen;
+  apple.y += ny * pen;
+  var vn = apple.vx * nx + apple.vy * ny;
+  if (vn < 0) {
+    apple.vx -= (1 + BOUNCE_REST) * vn * nx;
+    apple.vy -= (1 + BOUNCE_REST) * vn * ny;
+    var outN = apple.vx * nx + apple.vy * ny;
+    if (outN < BOUNCE_MIN) {
+      apple.vx += (BOUNCE_MIN - outN) * nx;
+      apple.vy += (BOUNCE_MIN - outN) * ny;
+    }
+    t.sq = 1;                       // squash animation
+    sfx.bounce();
+  }
+  return true;
+}
+
+function updatePlay(dt) {
+  // launcher aim (only when no apple flying)
+  var lspeed = 90;
+  if (!game.apple) {
+    if (keyDown("arrowleft") || keyDown("a")) game.launcherX -= lspeed * dt;
+    if (keyDown("arrowright") || keyDown("d")) game.launcherX += lspeed * dt;
+    game.launcherX = clamp(game.launcherX, PLAY_L + 6, PLAY_R - 6);
+    if (justPressed(" ")) dropApple();
+  }
+
+  // ghosts
+  for (var i = 0; i < game.ghosts.length; i++) {
+    var g = game.ghosts[i];
+    var dxg = g.bx - g.ax, dyg = g.by - g.ay;
+    var len = Math.sqrt(dxg * dxg + dyg * dyg) || 1;
+    g.t += (g.speed / len) * dt;
+    var tri = Math.abs(((g.t % 2) + 2) % 2 - 1); // 0..1..0 triangle wave
+    g.x = g.ax + dxg * tri;
+    g.y = g.ay + dyg * tri;
+  }
+
+  // bouncer + trampoline squash relax
+  for (var b = 0; b < game.bouncers.length; b++) {
+    if (game.bouncers[b].sq > 0) game.bouncers[b].sq = Math.max(0, game.bouncers[b].sq - dt * 5);
+  }
+  for (var ti = 0; ti < game.tramps.length; ti++) {
+    if (game.tramps[ti].sq > 0) game.tramps[ti].sq = Math.max(0, game.tramps[ti].sq - dt * 5);
+  }
+
+  // apple physics
+  var a = game.apple;
+  if (a && a.alive) {
+    a.vy += GRAVITY * dt;
+    if (a.vy > MAX_FALL) a.vy = MAX_FALL;
+    a.x += a.vx * dt;
+    a.y += a.vy * dt;
+
+    // side walls
+    if (a.x < PLAY_L + a.r) { a.x = PLAY_L + a.r; a.vx = -a.vx * WALL_REST; }
+    if (a.x > PLAY_R - a.r) { a.x = PLAY_R - a.r; a.vx = -a.vx * WALL_REST; }
+
+    // solid + bouncy blocks
+    for (var w = 0; w < game.walls.length; w++) collide(a, game.walls[w]);
+    for (var bb = 0; bb < game.bouncers.length; bb++) collide(a, game.bouncers[bb]);
+    for (var tr = 0; tr < game.tramps.length; tr++) collideTramp(a, game.tramps[tr]);
+
+    // ghosts eat apples (circle vs ghost box, slightly generous)
+    for (var gi = 0; gi < game.ghosts.length; gi++) {
+      var gg = game.ghosts[gi];
+      var gcx = clamp(a.x, gg.x - gg.w / 2, gg.x + gg.w / 2);
+      var gcy = clamp(a.y, gg.y - gg.h / 2, gg.y + gg.h / 2);
+      var ddx = a.x - gcx, ddy = a.y - gcy;
+      if (ddx * ddx + ddy * ddy <= (a.r - 1) * (a.r - 1)) {
+        a.alive = false;
+        burst(a.x, a.y, C.apple, 12);
+        burst(gg.x, gg.y, C.ghostHi, 6);
+        spendApple(true);
+        break;
+      }
+    }
+    if (!a.alive) return;
+
+    // reached exit gap?
+    if (a.y + a.r >= FY && a.x > game.exit.x + 2 && a.x < game.exit.x + game.exit.w - 2) {
+      if (a.y > FY + 4) { burst(a.x, FY + 6, C.exit, 14); clearLevel(); return; }
+    }
+
+    // off the bottom entirely without clearing (shouldn't happen due to floor, safety)
+    if (a.y - a.r > VH + 4) { spendApple(false); return; }
+
+    // settle detection (resting on floor/wall without clearing)
+    var sp = Math.sqrt(a.vx * a.vx + a.vy * a.vy);
+    if (sp < SETTLE_SPEED && a.y > HUD_H + 20) {
+      game.settle++;
+      if (game.settle > SETTLE_TICKS) { burst(a.x, a.y, C.appleHi, 8); spendApple(false); return; }
+    } else {
+      game.settle = 0;
+    }
+  }
+
+  // particles
+  for (var p = game.particles.length - 1; p >= 0; p--) {
+    var pt = game.particles[p];
+    pt.t += dt;
+    pt.vy += GRAVITY * 0.5 * dt;
+    pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+    if (pt.t >= pt.life) game.particles.splice(p, 1);
+  }
+}
+
+//--------------------------------------------------------------- drawing
+function px(x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(x | 0, y | 0, w | 0, h | 0); }
+
+function drawBackground() {
+  // vertical gradient-ish bands
+  px(0, 0, VW, VH, C.bg0);
+  ctx.fillStyle = C.bg1;
+  for (var y = HUD_H; y < VH; y += 16) ctx.fillRect(0, y, VW, 8);
+}
+
+function drawWall(w) {
+  px(w.x, w.y, w.w, w.h, C.wall);
+  px(w.x, w.y, w.w, 2, C.wallHi);
+}
+
+function drawBumper(b) {
+  var s = b.sq; // 0..1
+  var yy = b.y + s * 3, hh = b.h - s * 3;
+  px(b.x - 1, yy - 1, b.w + 2, hh + 2, C.bounce);
+  px(b.x, yy, b.w, 2, C.bounceHi);
+  // arrow hint
+  ctx.fillStyle = C.bounceHi;
+  var mx = b.x + b.w / 2;
+  ctx.fillRect(mx - 2, yy + 3, 4, 2);
+  ctx.fillRect(mx - 1, yy + 1, 2, 2);
+}
+
+function drawTramp(t) {
+  var s = t.sq || 0;                     // 0..1 squash on impact
+  var ry = t.r - s * 2, rx = t.r + s * 1.5;
+  // dark base ring
+  ctx.fillStyle = C.trampDk;
+  ctx.beginPath(); ctx.ellipse(t.x, t.y + 1, rx + 1, ry + 1, 0, 0, Math.PI * 2); ctx.fill();
+  // green body
+  ctx.fillStyle = C.tramp;
+  ctx.beginPath(); ctx.ellipse(t.x, t.y, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+  // top highlight (springy shine)
+  px(t.x - 2, t.y - ry + 1, 3, 2, C.trampHi);
+  px(t.x - rx + 1, t.y - 1, 2, 2, C.trampHi);
+}
+
+function drawGhost(g) {
+  var x = g.x - g.w / 2, y = g.y - g.h / 2, w = g.w, h = g.h;
+  ctx.fillStyle = C.ghost;
+  // rounded top
+  ctx.fillRect(x + 2, y, w - 4, 2);
+  ctx.fillRect(x + 1, y + 2, w - 2, 2);
+  ctx.fillRect(x, y + 4, w, h - 8);
+  // wavy skirt
+  for (var i = 0; i < w; i += 4) {
+    var hh = ((i / 4) % 2 === 0) ? h - 4 : h - 7;
+    ctx.fillRect(x + i, y + 4, 4, hh - 4);
+  }
+  // highlight
+  px(x + 2, y + 2, 2, 3, C.ghostHi);
+  // eyes
+  px(x + 3, y + 5, 4, 4, C.ghostEye);
+  px(x + w - 7, y + 5, 4, 4, C.ghostEye);
+  // pupils look toward travel direction
+  var pdx = g.bx > g.ax ? 1 : (g.bx < g.ax ? -1 : 0);
+  var pv = Math.sin(g.t * Math.PI) >= 0 ? pdx : -pdx;
+  px(x + 4 + pv, y + 6, 2, 2, C.ghostPup);
+  px(x + w - 6 + pv, y + 6, 2, 2, C.ghostPup);
+}
+
+function drawApple(a) {
+  ctx.fillStyle = C.apple;
+  ctx.beginPath();
+  ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2);
+  ctx.fill();
+  px(a.x - 2, a.y - 3, 2, 2, C.appleHi);
+  // stem + leaf
+  px(a.x, a.y - a.r - 2, 1, 2, C.stem);
+  px(a.x + 1, a.y - a.r - 2, 2, 1, C.leaf);
+}
+
+function drawExit() {
+  var e = game.exit;
+  // glowing gap in the floor
+  for (var i = 0; i < 4; i++) {
+    px(e.x, FY + i * 3, e.w, 2, i % 2 ? C.exit : C.exitDk);
+  }
+  // side posts
+  px(e.x - 2, FY - 4, 2, VH - FY + 4, C.exitDk);
+  px(e.x + e.w, FY - 4, 2, VH - FY + 4, C.exitDk);
+  // chevrons pointing down
+  ctx.fillStyle = C.exit;
+  var mx = e.x + e.w / 2;
+  ctx.fillRect(mx - 1, FY - 8, 2, 2);
+}
+
+function drawLauncher() {
+  var x = game.launcherX;
+  // barrel
+  px(x - 6, HUD_H - 2, 12, 4, C.launch);
+  px(x - 2, HUD_H + 2, 4, 4, C.launchHi);
+  // aim line (dotted) when idle
+  if (!game.apple) {
+    ctx.fillStyle = C.launch;
+    for (var y = HUD_H + 8; y < FY; y += 8) ctx.fillRect(x - 0.5 | 0, y, 1, 3);
+  }
+  // pixel apple sitting in launcher when ready
+  if (!game.apple && game.apples > 0) {
+    ctx.fillStyle = C.apple;
+    ctx.beginPath(); ctx.arc(x, HUD_H + 6, 3, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawParticles() {
+  for (var i = 0; i < game.particles.length; i++) {
+    var p = game.particles[i];
+    var k = 1 - p.t / p.life;
+    ctx.globalAlpha = k;
+    px(p.x - 1, p.y - 1, 2, 2, p.color);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawApples(n, x, y) {
+  for (var i = 0; i < n; i++) {
+    var ax = x + i * 9;
+    ctx.fillStyle = C.apple;
+    ctx.beginPath(); ctx.arc(ax + 3, y + 3, 3, 0, Math.PI * 2); ctx.fill();
+    px(ax + 3, y - 1, 1, 2, C.stem);
+  }
+}
+
+function drawText(str, x, y, color, size, align) {
+  ctx.fillStyle = color || C.text;
+  ctx.font = (size || 8) + "px monospace";
+  ctx.textAlign = align || "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(str, x, y);
+  ctx.textAlign = "left";
+}
+
+function drawHUD() {
+  px(0, 0, VW, HUD_H, C.hud);
+  px(0, HUD_H - 1, VW, 1, C.wall);
+  drawText("LV " + (game.levelIndex + 1) + "/" + LEVELS.length, 6, 4, C.accent, 9);
+  drawText("APPLES", 6, 17, C.textDim, 7);
+  drawApples(game.apples, 44, 15);
+  drawText("SCORE " + game.score, VW - 6, 4, C.text, 9, "right");
+  drawText("SPENT " + money(game.moneySpent), VW - 6, 17, C.textDim, 7, "right");
+}
+
+function drawPlayField() {
+  drawBackground();
+  drawExit();
+  for (var w = 0; w < game.walls.length; w++) drawWall(game.walls[w]);
+  for (var b = 0; b < game.bouncers.length; b++) drawBumper(game.bouncers[b]);
+  for (var tr = 0; tr < game.tramps.length; tr++) drawTramp(game.tramps[tr]);
+  for (var g = 0; g < game.ghosts.length; g++) drawGhost(game.ghosts[g]);
+  drawLauncher();
+  if (game.apple) drawApple(game.apple);
+  drawParticles();
+  drawHUD();
+}
+
+//--------------------------------------------------------------- overlays
+function centerBox(y, h) { px(20, y, VW - 40, h, "rgba(8,6,15,0.88)"); px(20, y, VW - 40, 2, C.accent); px(20, y + h - 2, VW - 40, 2, C.accent); }
+
+function drawTitle() {
+  drawBackground();
+  // draw a few decorative ghosts + apple
+  drawGhost({ x: 44, y: 210, w: 15, h: 15, ax: 0, bx: 1, t: 0.2 });
+  drawGhost({ x: 156, y: 210, w: 15, h: 15, ax: 1, bx: 0, t: 0.7 });
+  ctx.textAlign = "center";
+  drawText("APPLE", VW / 2, 70, C.apple, 26, "center");
+  drawText("DROP", VW / 2, 98, C.exit, 26, "center");
+  drawText("- an unfair arcade -", VW / 2, 132, C.textDim, 8, "center");
+  drawText("INSERT COIN  -  10p PER PLAY", VW / 2, 156, C.exit, 8, "center");
+  var blink = ((game.blink | 0) % 2) === 0;
+  if (blink) drawText("PRESS ENTER", VW / 2, 172, C.accent, 10, "center");
+  drawText("3 apples, 10 levels, no mercy", VW / 2, 205, C.textDim, 7, "center");
+  drawText("ghosts hog the lane  •  time your drop", VW / 2, 216, C.textDim, 7, "center");
+  drawText("land 1 in the green gap to survive", VW / 2, 227, C.textDim, 7, "center");
+  ctx.textAlign = "left";
+}
+
+function drawClear() {
+  drawPlayField();
+  centerBox(110, 70);
+  drawText("LEVEL " + (game.levelIndex + 1) + " CLEAR", VW / 2, 122, C.exit, 11, "center");
+  drawText("+" + (500 + game.apples * 100 + game.levelIndex * 50) + " pts", VW / 2, 140, C.text, 8, "center");
+  if (game.flashTimer <= 0) {
+    var blink = ((game.blink | 0) % 2) === 0;
+    if (blink) drawText("PRESS ENTER", VW / 2, 158, C.accent, 9, "center");
+  }
+}
+
+function drawOver() {
+  drawPlayField();
+  centerBox(96, 108);
+  drawText("GAME OVER", VW / 2, 104, C.danger, 13, "center");
+  drawText("out of apples on level " + (game.levelIndex + 1), VW / 2, 124, C.textDim, 7, "center");
+  drawText("spent so far  " + money(game.moneySpent), VW / 2, 138, C.text, 8, "center");
+  if (game.flashTimer <= 0) {
+    var blink = ((game.blink | 0) % 2) === 0;
+    if (blink) drawText("INSERT 10p - PRESS ENTER", VW / 2, 160, C.exit, 8, "center");
+    drawText("to continue on level " + (game.levelIndex + 1), VW / 2, 172, C.textDim, 7, "center");
+    drawText("Q = give up", VW / 2, 186, C.textDim, 7, "center");
+  }
+}
+
+function drawWin() {
+  drawBackground();
+  ctx.textAlign = "center";
+  drawText("YOU WIN!", VW / 2, 90, C.exit, 22, "center");
+  drawText("all 10 levels cleared", VW / 2, 116, C.text, 8, "center");
+  drawText("FINAL SCORE  " + game.score, VW / 2, 134, C.textDim, 8, "center");
+  drawText("YOU FED THE MACHINE", VW / 2, 156, C.textDim, 8, "center");
+  drawText(money(game.moneySpent), VW / 2, 168, C.accent, 16, "center");
+  drawText("(" + game.coins + " coin" + (game.coins === 1 ? "" : "s") + " @ 10p)", VW / 2, 190, C.textDim, 7, "center");
+  var blink = ((game.blink | 0) % 2) === 0;
+  if (blink) drawText("PRESS ENTER", VW / 2, 212, C.accent, 9, "center");
+  ctx.textAlign = "left";
+}
+
+//--------------------------------------------------------------- present (upscale + CRT)
+function present() {
+  sctx.imageSmoothingEnabled = false;
+  sctx.clearRect(0, 0, screen.width, screen.height);
+  sctx.drawImage(buf, 0, 0, VW, VH, 0, 0, screen.width, screen.height);
+  // scanlines
+  sctx.fillStyle = "rgba(0,0,0,0.22)";
+  var lineGap = Math.max(2, scale);
+  for (var y = 0; y < screen.height; y += lineGap) sctx.fillRect(0, y, screen.width, 1);
+  // vignette
+  var g = sctx.createRadialGradient(
+    screen.width / 2, screen.height / 2, screen.height * 0.35,
+    screen.width / 2, screen.height / 2, screen.height * 0.75);
+  g.addColorStop(0, "rgba(0,0,0,0)");
+  g.addColorStop(1, "rgba(0,0,0,0.5)");
+  sctx.fillStyle = g;
+  sctx.fillRect(0, 0, screen.width, screen.height);
+}
+
+//--------------------------------------------------------------- main loop
+var last = 0, acc = 0, FIXED = 1 / 60, blinkAcc = 0;
+function frame(now) {
+  if (!last) last = now;
+  var elapsed = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  acc += elapsed;
+  blinkAcc += elapsed;
+  if (blinkAcc > 0.4) { blinkAcc = 0; game.blink = (game.blink | 0) + 1; }
+  if (game.flashTimer > 0) game.flashTimer -= elapsed * 1000;
+
+  // fixed-step updates
+  var steps = 0;
+  while (acc >= FIXED && steps < 6) {
+    step();
+    acc -= FIXED;
+    steps++;
+  }
+
+  // draw
+  switch (game.state) {
+    case GS.TITLE: drawTitle(); break;
+    case GS.PLAY:  drawPlayField(); break;
+    case GS.CLEAR: drawClear(); break;
+    case GS.OVER:  drawOver(); break;
+    case GS.WIN:   drawWin(); break;
+  }
+  present();
+  requestAnimationFrame(frame);
+}
+
+function step() {
+  switch (game.state) {
+    case GS.TITLE:
+      if (justPressed("enter")) { startRun(); beep(660, 0.08, "square", 0.06); }
+      break;
+    case GS.PLAY:
+      updatePlay(FIXED);
+      break;
+    case GS.CLEAR:
+      if (game.flashTimer <= 0 && justPressed("enter")) nextLevel();
+      break;
+    case GS.OVER:
+      if (game.flashTimer <= 0) {
+        if (justPressed("enter")) { continueRun(); beep(880, 0.08, "square", 0.06); setTimeout(function(){beep(1180,0.08,"square",0.06);},70); }
+        else if (justPressed("q")) game.state = GS.TITLE;
+      }
+      break;
+    case GS.WIN:
+      if (game.flashTimer <= 0 && justPressed("enter")) game.state = GS.TITLE;
+      break;
+  }
+  // clear one-shot presses that no handler consumed this step
+  pressed = {};
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
